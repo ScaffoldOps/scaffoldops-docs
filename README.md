@@ -1,150 +1,230 @@
-# ScaffoldOps — Project Handoff / Context Summary
+# ScaffoldOps Docs
 
-## Overview
+Implementation-aligned documentation for the current local ScaffoldOps workspace.
 
-**ScaffoldOps** is a platform for automated generation and deployment of microservices on Kubernetes.
+This repository is the cross-repository documentation index for the platform code that currently exists in:
 
-The core idea is similar to **Spring Initializr**, but extended so that the platform not only generates a starter project, but also prepares it for packaging and deployment, and tracks the lifecycle of that process.
+- `generator-api`
+- `generator-worker`
+- `platform-infra`
+- `generator-api-actions-runner`
+- `generator-worker-actions-runner`
+- `platform-infra-actions-runner`
 
-ScaffoldOps should:
-- accept a **microservice specification**
-- generate a standardized microservice from a template
-- package it
-- deploy it to Kubernetes
-- expose lifecycle status to the user
+## What ScaffoldOps Is
 
-This is the **platform project**.
+ScaffoldOps is a platform for accepting microservice generation requests, persisting them, publishing them to Kafka, and processing them asynchronously in a worker service.
 
-A separate future project called **Energyco / energyC&O** was discussed, but it is **not part of ScaffoldOps MVP**.
+Today, the implemented platform is centered on:
 
----
+- a REST entrypoint service: `generator-api`
+- an asynchronous Kafka consumer: `generator-worker`
+- shared Kubernetes infrastructure: PostgreSQL, Keycloak, Kafka, Kafka UI, and namespaces
+- GitHub Actions pipelines running on self-hosted runners
 
-## Final Project Description
+The codebase is beyond the original “planned MVP” description, but it is not yet a complete end-to-end scaffold-and-deploy platform. In particular, there is currently no implemented `deployment-worker`, no real project generation engine, and no real lifecycle callback integration from the worker back into the API.
 
-**ScaffoldOps** is a platform for generating, packaging, and deploying standardized microservices from a declarative specification. It automates project scaffolding, containerization, and Kubernetes deployment to reduce repetitive setup work and accelerate microservice development.
+## Current Platform Topology
 
-### Academic title
-**ScaffoldOps: A Platform for Automated Generation and Deployment of Microservices on Kubernetes**
+### Application repositories
 
----
+- `generator-api`
+  - Spring Boot 3 / Java 17 REST API
+  - accepts generation requests
+  - validates and stores them in PostgreSQL
+  - publishes `generation-requested` Kafka events
+  - secures generation endpoints with JWT bearer auth
+- `generator-worker`
+  - Spring Boot 3 / Java 17 background worker
+  - consumes `generation-requested` events from Kafka
+  - performs placeholder generation handling
+  - emits placeholder lifecycle updates to logging adapters
+  - exposes only actuator endpoints
 
-## Scope Decision
+### Infrastructure repository
 
-We explicitly separated two ideas:
+- `platform-infra`
+  - Kustomize-based Kubernetes source of truth for shared environments
+  - manages namespaces, shared PostgreSQL, Keycloak, Kafka, Kafka UI, and Kafka topic bootstrap
 
-### ScaffoldOps
-An internal developer platform / generator platform.
+### Operational repositories
 
-### Energyco / energyC&O
-A future separate business/domain project for energy price collection, analytics, alerts, and APIs.
+- `generator-api-actions-runner`
+- `generator-worker-actions-runner`
+- `platform-infra-actions-runner`
 
-ScaffoldOps must remain focused on:
-- generation
-- standardization
-- deployment
-- lifecycle tracking
+These are local self-hosted GitHub Actions runner installations used by the pipelines in the application and infrastructure repositories. They are operational support assets, not product code.
 
-It should **not** become a generic “everything platform.”
+## End-to-End Flow
 
----
+The current implemented flow is:
 
-## MVP Architecture
+1. A client obtains a JWT from Keycloak for the `scaffoldops` realm.
+2. The client calls `POST /api/generator/v1/generation-requests` on `generator-api`.
+3. `generator-api` validates the request and stores it in PostgreSQL with status `RECEIVED`.
+4. `generator-api` publishes a Kafka message to the `generation-requested` topic.
+5. `generator-worker` consumes the Kafka message.
+6. `generator-worker` emits placeholder lifecycle transitions:
+   - `GENERATING`
+   - `GENERATED` on success
+   - `FAILED` on error
+7. The worker currently logs those lifecycle updates instead of sending them back to a real downstream API.
 
-### Core services
-ScaffoldOps MVP should have **3 core microservices**:
+The API status model already includes future-facing values such as `DEPLOYING` and `DEPLOYED`, but the deployed code does not yet implement the deployment stage.
 
-#### 1. `generator-api`
-The front door of the platform.
+## Repository Map
 
-Responsibilities:
-- receive the microservice specification
-- validate the request
-- persist the request
-- expose status endpoints
-- trigger the next workflow step
+### `generator-api`
 
-It should **not** do code generation itself and should **not** deploy directly.
+Main responsibilities:
 
-#### 2. `generator-worker`
-Responsibilities:
-- consume generation requests
-- generate the microservice from a template
-- create the project structure and files
-- generate Dockerfile / deployment assets
-- prepare the project for build/deploy
+- persistence of generation requests
+- JWT-protected REST interface
+- OpenAPI-backed contract
+- Kafka publication after request creation
 
-#### 3. `deployment-worker`
-Responsibilities:
-- react after generation is complete
-- deploy the generated service to Kubernetes
-- update lifecycle status
-- later maybe coordinate image build/push or GitOps steps
+Key details:
 
----
+- base path: `/api/generator/v1`
+- public docs: Swagger UI and OpenAPI JSON
+- public actuator health endpoints
+- Kafka topic default: `generation-requested`
+- JWT issuer default: `http://localhost:8091/realms/scaffoldops`
 
-## Supporting platform components
+Important references in that repository:
 
-### Keycloak
-Used for:
-- platform login
-- token issuance
-- protecting ScaffoldOps APIs
+- `README.md`
+- `docs/API.md`
+- `src/main/resources/openapi/generator-api.yaml`
+- `k8s/deployment/`
+- `.github/workflows/`
 
-Keycloak is a **supporting platform component**, not the thesis core.
+### `generator-worker`
 
-### Kafka
-Optional for MVP, but discussed as a way to represent lifecycle events such as:
-- request received
-- generation started
-- generation finished
-- deployment started
-- deployment failed / succeeded
+Main responsibilities:
 
-Kafka should support the platform workflow, not dominate the project scope.
+- Kafka consumption
+- asynchronous job orchestration shell
+- placeholder lifecycle handling
+- placeholder project generation adapter
 
-### API Gateway
-Discussed, but **not a first-priority MVP component**.
+Key details:
 
----
+- no public business API
+- actuator endpoints only
+- Kafka consumer group default: `generator-worker`
+- topic default: `generation-requested`
+- local lifecycle base URL default: `http://localhost:8081`
 
-## What `generator-api` is supposed to do
+Important references in that repository:
 
-`generator-api` is the **entrypoint/orchestrator API** of ScaffoldOps.
+- `README.md`
+- `docs/ARCHITECTURE.md`
+- `src/main/resources/application*.yml`
+- `k8s/deployment/`
+- `.github/workflows/`
 
-### It should:
-- accept a generation request
-- validate it
-- store it in PostgreSQL
-- set/request lifecycle status
-- expose status retrieval endpoints
+### `platform-infra`
 
-### It should not:
-- contain code generation logic
-- build Docker images
-- deploy to Kubernetes
-- include Kafka initially
-- include complex auth logic initially
+Main responsibilities:
 
-### Initial endpoints
-- `POST /generation-requests`
-- `GET /generation-requests/{id}`
-- optionally `GET /generation-requests`
+- namespace bootstrap
+- shared PostgreSQL in `scaffoldops`
+- Keycloak in `security`
+- Kafka and Kafka UI in `scaffoldops-dev`
+- Kafka topic bootstrap job for `generation-requested`
 
----
+Important references in that repository:
 
-## First implementation step
+- `README.md`
+- `k8s/base/`
+- `k8s/overlays/local-dev`
+- `k8s/overlays/dev`
+- `.github/workflows/platform-infra.yml`
 
-We agreed the first thing to build is the **generation request contract**, not the workers.
+## Environments
 
-### Example request payload
+The current repositories model two main deployment tracks:
 
-```json
-{
-  "name": "billing-service",
-  "template": "spring-boot-hexagonal",
-  "database": true,
-  "restApi": true,
-  "security": true,
-  "messaging": false,
-  "deploymentTarget": "kubernetes"
-}
+- `develop` branch
+  - application repos build, test, publish Docker images, and deploy to `scaffoldops-dev`
+  - Spring profile: `dev`
+- `main` branch
+  - application repos build, test, publish Docker images, and deploy to `scaffoldops-pre`
+  - Spring profile: `pre`
+
+Shared infrastructure behaves slightly differently by overlay:
+
+- `k8s/overlays/local-dev`
+  - deploys namespaces, PostgreSQL, Keycloak, Kafka, Kafka UI, and topic bootstrap
+- `k8s/overlays/dev`
+  - deploys namespaces plus Kafka, Kafka UI, and topic bootstrap
+  - does not deploy PostgreSQL or Keycloak from this repo
+
+## Namespaces
+
+Namespaces currently visible in the source repos:
+
+- `security`
+  - Keycloak
+- `scaffoldops`
+  - shared PostgreSQL
+- `scaffoldops-dev`
+  - Kafka, Kafka UI, dev application deployments
+- `scaffoldops-pre`
+  - targeted by application PRE deployments, but not bootstrapped by the current `platform-infra` base
+
+That last point matters: the application pipelines deploy to `scaffoldops-pre`, while the current `platform-infra` README and manifests are centered on `security`, `scaffoldops`, and `scaffoldops-dev`. This should be treated as a current environment gap or an external prerequisite, not as something already fully managed here.
+
+## Delivery Model
+
+### Application CI/CD
+
+Both `generator-api` and `generator-worker` currently use similar GitHub Actions pipelines:
+
+- PR checks for pull requests to `develop` and `main`
+- `develop` pipeline
+  - Maven quality step
+  - Maven test step
+  - Docker image build
+  - Docker image push
+  - Kubernetes deploy to `scaffoldops-dev`
+- `main` pipeline
+  - Maven quality step
+  - Maven test step
+  - Docker image build
+  - Docker image push
+  - Kubernetes deploy to `scaffoldops-pre`
+
+### Infra CI/CD
+
+`platform-infra` currently:
+
+- validates rendered manifests on pull requests and `main`
+- supports workflow-dispatch deployment of the `local-dev` overlay
+
+## Current State Summary
+
+Implemented:
+
+- request submission API
+- PostgreSQL persistence for requests
+- JWT resource server configuration
+- Kafka publication from API
+- Kafka consumption in worker
+- worker lifecycle state shell
+- Kubernetes manifests for API, worker, PostgreSQL, Keycloak, Kafka, and Kafka UI
+- self-hosted GitHub Actions based delivery pipelines
+
+Not implemented yet:
+
+- real scaffold generation output
+- lifecycle callback/update path back into `generator-api`
+- deployment worker
+- actual deployment stage execution
+- retry, dead-letter, or idempotency workflow in the worker
+- ingress, API gateway, or external managed infra
+
+## Related Document
+
+For the implementation-aligned system architecture, see [architecture.md](architecture.md).
