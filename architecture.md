@@ -29,6 +29,7 @@ At a high level:
 - Keycloak provides JWT issuance for protected API access
 - Kubernetes manifests and environment overlays are managed in `platform-infra`
 
+
 ## 3. Implemented Components
 
 ### 3.1 `generator-api`
