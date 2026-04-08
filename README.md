@@ -31,6 +31,7 @@ The target-state architecture now also defines:
 
 The codebase is beyond the original planned MVP, but it is not yet a complete end-to-end scaffold-and-deploy platform. In particular, there is currently no implemented `deployment-worker`, no real project generation engine output, and no real lifecycle callback integration from workers back into the API.
 
+
 ## Architecture References
 
 - Current and target-state architecture narrative: `architecture.md`
