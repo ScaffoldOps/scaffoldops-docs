@@ -35,7 +35,9 @@ The codebase is beyond the original planned MVP, but it is not yet a complete en
 
 - Current and target-state architecture narrative: `architecture.md`
 - High-level diagrams and responsibility model: `docs/architecture/high-level-architecture.md`
-- Refined target-state sequence UML: `docs/uml/scaffoldops-flow.puml`
+- Refined target-state sequence UML source: `docs/uml/scaffoldops-flow.puml`
+
+The rendered target-state sequence diagram is available in [docs/architecture/high-level-architecture.md](/home/victor/workspace/ScaffoldOps/scaffoldops-docs/docs/architecture/high-level-architecture.md). It represents the intended target-state architecture, not a claim that the full deployment-stage flow is already implemented today.
 
 ## Current Platform Topology
 

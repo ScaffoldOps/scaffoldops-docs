@@ -56,6 +56,68 @@ The target state extends the current platform without changing core ownership:
 - `deployment-worker` consumes that event and deploys the generated artifact or manifest bundle to Kubernetes.
 - Clients continue to read lifecycle state only from `generator-api`.
 
+### Target-State Sequence Diagram
+
+The diagram below is the target-state architecture flow. It describes the intended end-to-end generation-to-deployment lifecycle and is not a claim that the deployment stage is already implemented in the current platform.
+
+`docs/uml/scaffoldops-flow.puml` remains the source of truth for this flow. This Mermaid rendering exists so the diagram is visible in markdown-based documentation where native PlantUML rendering is not configured.
+
+[PlantUML source: `docs/uml/scaffoldops-flow.puml`](/home/victor/workspace/ScaffoldOps/scaffoldops-docs/docs/uml/scaffoldops-flow.puml)
+
+```mermaid
+sequenceDiagram
+    actor Client
+    participant Keycloak
+    participant API as generator-api
+    participant DB as PostgreSQL
+    participant GenTopic as Kafka topic: generation-requested
+    participant GenWorker as generator-worker
+    participant ArtifactStore as Artifact Store
+    participant DepTopic as Kafka topic: deployment-requested
+    participant DepWorker as deployment-worker
+    participant K8s as Kubernetes
+
+    Client->>Keycloak: Authenticate
+    Keycloak-->>Client: JWT
+
+    Client->>API: Create generation request
+    API->>DB: Save request (RECEIVED)
+    API->>GenTopic: Publish generation-requested
+    API-->>Client: Request accepted
+
+    GenTopic->>GenWorker: Consume generation-requested
+    GenWorker->>API: Update status (GENERATING)
+    API->>DB: Persist GENERATING
+
+    GenWorker->>ArtifactStore: Generate artifact/manifests
+    ArtifactStore-->>GenWorker: artifactRef
+
+    GenWorker->>API: Update status (GENERATED)
+    API->>DB: Persist GENERATED
+
+    GenWorker->>DepTopic: Publish deployment-requested
+    Note over GenWorker,DepTopic: requestId, artifactRef, target
+
+    DepTopic->>DepWorker: Consume deployment-requested
+    DepWorker->>API: Update status (DEPLOYING)
+    API->>DB: Persist DEPLOYING
+
+    DepWorker->>K8s: Deploy artifact/manifests
+    alt deployment success
+        K8s-->>DepWorker: Ready
+        DepWorker->>API: Update status (DEPLOYED)
+        API->>DB: Persist DEPLOYED
+    else deployment failure
+        K8s-->>DepWorker: Error
+        DepWorker->>API: Update status (FAILED)
+        API->>DB: Persist FAILED
+    end
+
+    Client->>API: Get request status
+    API->>DB: Read current status
+    API-->>Client: Current lifecycle state
+```
+
 ### Target-State System Context
 
 ```mermaid
@@ -169,3 +231,5 @@ flowchart LR
 - The current deployed workflow only implements the intake plus generation shell.
 - The target state should add lifecycle update endpoints or an equivalent internal contract in `generator-api` before workers are expected to converge request state.
 - The target state should also add idempotency handling, retry strategy, and durable event publication around the generation-to-deployment handoff.
+
+For the target-state sequence source, see [PlantUML source: `docs/uml/scaffoldops-flow.puml`](/home/victor/workspace/ScaffoldOps/scaffoldops-docs/docs/uml/scaffoldops-flow.puml).
