@@ -4,6 +4,7 @@ Cross-repository architecture documentation for the current local ScaffoldOps wo
 
 This repository is the documentation index for the platform code that currently exists in:
 
+
 - `generator-api`
 - `generator-worker`
 - `platform-infra`
