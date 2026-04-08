@@ -1,8 +1,8 @@
 # ScaffoldOps Docs
 
-Implementation-aligned documentation for the current local ScaffoldOps workspace.
+Cross-repository architecture documentation for the current local ScaffoldOps workspace and its refined target state.
 
-This repository is the cross-repository documentation index for the platform code that currently exists in:
+This repository is the documentation index for the platform code that currently exists in:
 
 - `generator-api`
 - `generator-worker`
@@ -13,16 +13,28 @@ This repository is the cross-repository documentation index for the platform cod
 
 ## What ScaffoldOps Is
 
-ScaffoldOps is a platform for accepting microservice generation requests, persisting them, publishing them to Kafka, and processing them asynchronously in a worker service.
+ScaffoldOps is a platform for accepting microservice generation requests, persisting them, publishing them to Kafka, and processing them asynchronously through worker stages.
 
 Today, the implemented platform is centered on:
 
 - a REST entrypoint service: `generator-api`
-- an asynchronous Kafka consumer: `generator-worker`
+- an asynchronous generation-stage worker: `generator-worker`
 - shared Kubernetes infrastructure: PostgreSQL, Keycloak, Kafka, Kafka UI, and namespaces
 - GitHub Actions pipelines running on self-hosted runners
 
-The codebase is beyond the original “planned MVP” description, but it is not yet a complete end-to-end scaffold-and-deploy platform. In particular, there is currently no implemented `deployment-worker`, no real project generation engine, and no real lifecycle callback integration from the worker back into the API.
+The target-state architecture now also defines:
+
+- a future `deployment-worker`
+- a future `deployment-requested` Kafka topic
+- a durable artifact handoff between generation and deployment
+
+The codebase is beyond the original planned MVP, but it is not yet a complete end-to-end scaffold-and-deploy platform. In particular, there is currently no implemented `deployment-worker`, no real project generation engine output, and no real lifecycle callback integration from workers back into the API.
+
+## Architecture References
+
+- Current and target-state architecture narrative: `architecture.md`
+- High-level diagrams and responsibility model: `docs/architecture/high-level-architecture.md`
+- Refined target-state sequence UML: `docs/uml/scaffoldops-flow.puml`
 
 ## Current Platform Topology
 
@@ -40,6 +52,14 @@ The codebase is beyond the original “planned MVP” description, but it is not
   - performs placeholder generation handling
   - emits placeholder lifecycle updates to logging adapters
   - exposes only actuator endpoints
+
+### Target-state application component
+
+- `deployment-worker`
+  - not implemented yet
+  - will consume `deployment-requested`
+  - will deploy generated output to Kubernetes
+  - will report deployment-stage lifecycle transitions back through `generator-api`
 
 ### Infrastructure repository
 
@@ -64,11 +84,16 @@ The current implemented flow is:
 3. `generator-api` validates the request and stores it in PostgreSQL with status `RECEIVED`.
 4. `generator-api` publishes a Kafka message to the `generation-requested` topic.
 5. `generator-worker` consumes the Kafka message.
-6. `generator-worker` emits placeholder lifecycle transitions:
-   - `GENERATING`
-   - `GENERATED` on success
-   - `FAILED` on error
+6. `generator-worker` emits placeholder lifecycle transitions.
 7. The worker currently logs those lifecycle updates instead of sending them back to a real downstream API.
+
+The refined target-state flow extends that model:
+
+1. `generator-worker` keeps the generation engine internally.
+2. On successful generation it writes output to a durable artifact location.
+3. `generator-worker` publishes `deployment-requested`.
+4. `deployment-worker` consumes that event and deploys to Kubernetes.
+5. `generator-api` remains the lifecycle system of record for both generation and deployment stages.
 
 The API status model already includes future-facing values such as `DEPLOYING` and `DEPLOYED`, but the deployed code does not yet implement the deployment stage.
 

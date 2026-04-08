@@ -2,25 +2,23 @@
 
 ## Overview
 
-ScaffoldOps currently combines a synchronous API entrypoint with an asynchronous worker pipeline.
+ScaffoldOps currently has an implemented intake-and-generation shell, and a defined target state for generation-to-deployment orchestration.
 
-- `generator-api` is the synchronous entrypoint for generation requests.
-- `generator-api` persists requests in PostgreSQL and sets the initial lifecycle state, such as `RECEIVED`.
-- `generator-api` publishes a `generation-requested` event to Kafka.
-- `generator-worker` consumes that event and drives generation-stage transitions such as `RECEIVED -> GENERATING -> GENERATED` or `FAILED`.
-- Keycloak provides authentication for protected API endpoints.
-- Kafka UI is used for manual inspection of topics, messages, and consumer state.
-- `platform-infra` provides the shared platform dependencies used by the services.
+- The current implemented platform includes `generator-api`, `generator-worker`, PostgreSQL, Kafka, Kafka UI, Keycloak, and shared Kubernetes manifests in `platform-infra`.
+- The refined target state adds a future `deployment-worker`, a `deployment-requested` Kafka topic, and a durable artifact handoff between generation and deployment.
+- `generator-api` remains the lifecycle system of record in both the current and target architecture.
 
-## Current Architectural Style
+## Current Implemented Architecture
 
-ScaffoldOps currently follows a hybrid REST + event-driven architecture:
+The implemented system today is a hybrid REST + event-driven flow:
 
-- REST is used for synchronous request intake and request retrieval through `generator-api`.
-- Event-driven messaging is used to hand off accepted requests from `generator-api` to `generator-worker` through Kafka.
-- Shared infrastructure is provided centrally and consumed by application services.
+- `generator-api` accepts authenticated generation requests.
+- `generator-api` persists requests in PostgreSQL with initial status `RECEIVED`.
+- `generator-api` publishes `generation-requested` to Kafka.
+- `generator-worker` consumes that event and runs a placeholder generation-stage flow.
+- Worker lifecycle updates are currently logged, not persisted back through a real API contract.
 
-## System Context
+### Current System Context
 
 ```mermaid
 flowchart LR
@@ -35,10 +33,11 @@ flowchart LR
 
     user -->|Authenticate| keycloak
     user -->|Bearer token + generation request| api
-    api -->|Persist request + initial status RECEIVED| db
+    api -->|Persist request + status RECEIVED| db
     api -->|Publish generation-requested| kafka
     worker -->|Consume generation-requested| kafka
-    worker -->|Drive generation lifecycle| worker
+    worker -->|Placeholder generation flow| worker
+    worker -.->|Placeholder lifecycle logging| api
     ui -->|Inspect topics and messages| kafka
 
     infra -. provides shared infra definitions .-> db
@@ -47,88 +46,126 @@ flowchart LR
     infra -. provides shared infra definitions .-> ui
 ```
 
-## Deployment View
+## Refined Target-State Architecture
+
+The target state extends the current platform without changing core ownership:
+
+- `generator-api` continues to own request persistence and lifecycle status.
+- `generator-worker` keeps the generation engine internally and does not split it into a separate microservice.
+- After successful generation, `generator-worker` publishes a `deployment-requested` event.
+- `deployment-worker` consumes that event and deploys the generated artifact or manifest bundle to Kubernetes.
+- Clients continue to read lifecycle state only from `generator-api`.
+
+### Target-State System Context
 
 ```mermaid
-flowchart TB
-    subgraph ns_security[Namespace: security]
-        keycloak_svc[Keycloak Service]
-        keycloak_pod[Keycloak]
-        keycloak_svc --> keycloak_pod
-    end
+flowchart LR
+    user[Platform User or Client]
+    keycloak[Keycloak]
+    api[generator-api]
+    db[(PostgreSQL)]
+    kafka[(Kafka)]
+    genworker[generator-worker]
+    depworker[deployment-worker]
+    artifacts[(Artifact Store or Repo)]
+    k8s[Kubernetes]
+    ui[Kafka UI]
+    infra[platform-infra]
 
-    subgraph ns_scaffoldops[Namespace: scaffoldops]
-        postgres_svc[PostgreSQL Service]
-        postgres_pod[(PostgreSQL)]
-        postgres_svc --> postgres_pod
-    end
+    user -->|Authenticate| keycloak
+    user -->|Bearer token + generation request| api
+    api -->|Persist request + status RECEIVED| db
+    api -->|Publish generation-requested| kafka
 
-    subgraph ns_scaffoldops_dev[Namespace: scaffoldops-dev]
-        api_svc[generator-api Service]
-        api_pod[generator-api]
-        worker_svc[generator-worker Service]
-        worker_pod[generator-worker]
-        kafka_svc[Kafka Service]
-        kafka_pod[(Kafka Broker)]
-        kafka_ui_svc[Kafka UI Service]
-        kafka_ui_pod[Kafka UI]
+    genworker -->|Consume generation-requested| kafka
+    genworker -->|Run internal generation engine| artifacts
+    genworker -->|Lifecycle update: GENERATING / GENERATED / FAILED| api
+    genworker -->|Publish deployment-requested| kafka
 
-        api_svc --> api_pod
-        worker_svc --> worker_pod
-        kafka_svc --> kafka_pod
-        kafka_ui_svc --> kafka_ui_pod
-    end
+    depworker -->|Consume deployment-requested| kafka
+    depworker -->|Deploy artifact or manifests| k8s
+    depworker -->|Lifecycle update: DEPLOYING / DEPLOYED / FAILED| api
 
-    api_pod -->|JDBC| postgres_svc
-    api_pod -->|JWT validation / issuer| keycloak_svc
-    api_pod -->|Publish generation-requested| kafka_svc
-    worker_pod -->|Consume generation-requested| kafka_svc
-    kafka_ui_pod -->|Inspect broker and topics| kafka_svc
+    api -->|Persist lifecycle state| db
+    ui -->|Inspect topics and messages| kafka
+
+    infra -. provides shared infra definitions .-> db
+    infra -. provides shared infra definitions .-> kafka
+    infra -. provides shared infra definitions .-> keycloak
+    infra -. provides shared infra definitions .-> ui
 ```
 
-## Responsibilities By Component
+## Responsibility Boundaries
 
 ### `generator-api`
 
 - Accepts generation requests through REST.
-- Validates incoming request payloads.
-- Persists requests in PostgreSQL.
-- Sets the initial lifecycle state, such as `RECEIVED`.
-- Publishes `generation-requested` to Kafka.
-- Exposes protected request retrieval endpoints.
+- Validates incoming payloads.
+- Persists request records in PostgreSQL.
+- Sets the initial lifecycle state to `RECEIVED`.
+- Publishes `generation-requested`.
+- Exposes request retrieval endpoints.
+- Owns persisted lifecycle state for the full request lifecycle.
 
 ### `generator-worker`
 
-- Consumes `generation-requested` events from Kafka.
-- Orchestrates the generation stage asynchronously.
-- Advances lifecycle transitions such as `RECEIVED -> GENERATING -> GENERATED`.
-- Marks failed generation attempts as `FAILED`.
+- Consumes `generation-requested`.
+- Orchestrates generation asynchronously.
+- Updates lifecycle through `generator-api` for generation-stage progress.
+- Runs the generation engine internally.
+- Produces a durable artifact or manifest reference on success.
+- Publishes `deployment-requested` after generation succeeds.
+
+### `deployment-worker`
+
+- Future-state component, not implemented yet.
+- Consumes `deployment-requested`.
+- Orchestrates deployment asynchronously.
+- Deploys the generated output to Kubernetes.
+- Updates lifecycle through `generator-api` for deployment-stage progress.
 
 ### PostgreSQL
 
-- Stores generation request records.
-- Stores persisted lifecycle state owned by `generator-api`.
+- Stores request records and lifecycle status owned by `generator-api`.
 
 ### Kafka
 
-- Provides asynchronous decoupling between request intake and worker execution.
-- Carries the `generation-requested` topic used by the current flow.
+- Carries asynchronous handoff events between lifecycle stages.
+- Current topic: `generation-requested`.
+- Target-state additional topic: `deployment-requested`.
 
-### Keycloak
+### Artifact Store or Repo
 
-- Provides authentication and token issuance.
-- Acts as the JWT issuer for protected API access.
+- Holds the durable output from generation.
+- Provides the reference passed from `generator-worker` to `deployment-worker`.
+- Must be treated as a required architectural boundary in the target state rather than an implicit in-memory handoff.
 
-### Kafka UI
+## Target-State Flow
 
-- Provides manual operational visibility into Kafka topics and messages.
-- Helps inspect broker state, consumer groups, and published events.
+1. A client authenticates with Keycloak and submits a generation request to `generator-api`.
+2. `generator-api` persists the request in PostgreSQL with status `RECEIVED`.
+3. `generator-api` publishes `generation-requested`.
+4. `generator-worker` consumes the event and updates `generator-api` to `GENERATING`.
+5. `generator-worker` runs its internal generation engine and writes output to a durable artifact location.
+6. On successful generation, `generator-worker` publishes `deployment-requested` with `requestId`, artifact reference, and deployment target.
+7. `generator-worker` updates `generator-api` to `GENERATED`.
+8. `deployment-worker` consumes `deployment-requested` and updates `generator-api` to `DEPLOYING`.
+9. `deployment-worker` deploys the generated output to Kubernetes.
+10. `deployment-worker` updates `generator-api` to `DEPLOYED` on success or `FAILED` on deployment-stage failure.
+11. The client reads the latest lifecycle state from `generator-api`.
 
-## Update Notes
+## Key Contracts To Preserve
 
-Keep this document aligned with the implemented platform behavior:
+- `generator-api` is the system of record for lifecycle status.
+- `generator-worker` owns generation execution, not persistent lifecycle ownership.
+- `deployment-worker` owns deployment execution, not persistent lifecycle ownership.
+- `generation-requested` is the intake-to-generation handoff.
+- `deployment-requested` is the generation-to-deployment handoff.
+- The generation-to-deployment handoff must carry a durable artifact reference, not raw generated content.
 
-- update topic names if Kafka contracts change
-- update lifecycle transitions if worker behavior changes
-- update namespace placement if deployment topology changes
-- add new components only when they are implemented or actively deployed
+## Practical Incremental Notes
+
+- The current code already supports `RECEIVED`, `GENERATING`, `GENERATED`, `DEPLOYING`, `DEPLOYED`, and `FAILED` in the API contract.
+- The current deployed workflow only implements the intake plus generation shell.
+- The target state should add lifecycle update endpoints or an equivalent internal contract in `generator-api` before workers are expected to converge request state.
+- The target state should also add idempotency handling, retry strategy, and durable event publication around the generation-to-deployment handoff.
