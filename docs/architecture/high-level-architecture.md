@@ -2,10 +2,11 @@
 
 ## Overview
 
-ScaffoldOps currently has an implemented intake-and-generation shell, and a defined target state for generation-to-deployment orchestration.
+ScaffoldOps currently has an implemented intake-and-generation MVP, and a defined target state for generation-to-deployment orchestration.
 
 - The current implemented platform includes `generator-api`, `generator-worker`, PostgreSQL, Kafka, Kafka UI, Keycloak, and shared Kubernetes manifests in `platform-infra`.
-- The refined target state adds a future `deployment-worker`, a `deployment-requested` Kafka topic, and a durable artifact handoff between generation and deployment.
+- The current Kubernetes worker deployment persists generated artifacts with `generator-worker-artifacts-pvc` mounted at `/var/lib/generator-worker`.
+- The refined target state adds a future `deployment-worker`, a real Artifact Store, and a durable artifact-reference handoff between generation and deployment.
 - `generator-api` remains the lifecycle system of record in both the current and target architecture.
 
 ## Current Implemented Architecture
@@ -15,8 +16,11 @@ The implemented system today is a hybrid REST + event-driven flow:
 - `generator-api` accepts authenticated generation requests.
 - `generator-api` persists requests in PostgreSQL with initial status `RECEIVED`.
 - `generator-api` publishes `generation-requested` to Kafka.
-- `generator-worker` consumes that event and runs a placeholder generation-stage flow.
-- Worker lifecycle updates are currently logged, not persisted back through a real API contract.
+- `generator-worker` consumes that event and patches generation lifecycle state back to `generator-api`.
+- `generator-worker` writes a minimal Spring Boot project and `generation-manifest.json`.
+- In Kubernetes, generated output is stored under `/var/lib/generator-worker/manifests` on `generator-worker-artifacts-pvc`.
+- When a request is deleted, `generator-api` publishes `artifact-cleanup-requested` and `generator-worker` deletes its matching artifact directory.
+- Cleanup is eventually consistent, not transactional with the PostgreSQL delete; if `generator-worker` is down, cleanup waits until Kafka is consumed.
 
 ### Current System Context
 
@@ -28,6 +32,7 @@ flowchart LR
     db[(PostgreSQL)]
     kafka[(Kafka)]
     worker[generator-worker]
+    artifacts[(generator-worker-artifacts-pvc)]
     ui[Kafka UI]
     infra[platform-infra]
 
@@ -36,8 +41,11 @@ flowchart LR
     api -->|Persist request + status RECEIVED| db
     api -->|Publish generation-requested| kafka
     worker -->|Consume generation-requested| kafka
-    worker -->|Placeholder generation flow| worker
-    worker -.->|Placeholder lifecycle logging| api
+    worker -->|Generate Spring Boot project| artifacts
+    worker -->|PATCH lifecycle: GENERATING / GENERATED / FAILED| api
+    api -->|Persist lifecycle callback| db
+    api -->|Publish artifact-cleanup-requested on delete| kafka
+    worker -->|Consume cleanup + delete matching directory| artifacts
     ui -->|Inspect topics and messages| kafka
 
     infra -. provides shared infra definitions .-> db
@@ -52,9 +60,16 @@ The target state extends the current platform without changing core ownership:
 
 - `generator-api` continues to own request persistence and lifecycle status.
 - `generator-worker` keeps the generation engine internally and does not split it into a separate microservice.
-- After successful generation, `generator-worker` publishes a `deployment-requested` event.
+- A real Artifact Store replaces the current pod-local/PVC-backed `file://` artifact reference.
+- After successful generation, `generator-worker` publishes a `deployment-requested` event as the deployment handoff.
 - `deployment-worker` consumes that event and deploys the generated artifact or manifest bundle to Kubernetes.
 - Clients continue to read lifecycle state only from `generator-api`.
+
+Current ownership boundaries:
+
+- `generator-api` owns request lifecycle state and the deletion API.
+- `generator-worker` owns generated artifacts and PVC cleanup.
+- `generator-api` must not access the worker PVC directly.
 
 ### Target-State Sequence Diagram
 
@@ -175,7 +190,9 @@ flowchart LR
 - Orchestrates generation asynchronously.
 - Updates lifecycle through `generator-api` for generation-stage progress.
 - Runs the generation engine internally.
-- Produces a durable artifact or manifest reference on success.
+- Produces a generated project reference on success.
+- Uses `/var/lib/generator-worker/manifests` in Kubernetes, backed by `generator-worker-artifacts-pvc`.
+- Cleans up generated artifact directories after `artifact-cleanup-requested`.
 - Publishes `deployment-requested` after generation succeeds.
 
 ### `deployment-worker`
@@ -194,11 +211,13 @@ flowchart LR
 
 - Carries asynchronous handoff events between lifecycle stages.
 - Current topic: `generation-requested`.
+- Current cleanup topic: `artifact-cleanup-requested`.
 - Target-state additional topic: `deployment-requested`.
 
 ### Artifact Store or Repo
 
-- Holds the durable output from generation.
+- Future target-state component; the current MVP uses `generator-worker-artifacts-pvc`, not a real Artifact Store.
+- Holds the durable output from generation once the deployment stage exists.
 - Provides the reference passed from `generator-worker` to `deployment-worker`.
 - Must be treated as a required architectural boundary in the target state rather than an implicit in-memory handoff.
 
@@ -228,8 +247,10 @@ flowchart LR
 ## Practical Incremental Notes
 
 - The current code already supports `RECEIVED`, `GENERATING`, `GENERATED`, `DEPLOYING`, `DEPLOYED`, and `FAILED` in the API contract.
-- The current deployed workflow only implements the intake plus generation shell.
-- The target state should add lifecycle update endpoints or an equivalent internal contract in `generator-api` before workers are expected to converge request state.
+- The current deployed workflow implements intake plus generation to `GENERATED`.
+- The current `artifactRef` is a pod-local `file://` URI under `/var/lib/generator-worker/manifests`.
+- The PVC preserves generated files across `generator-worker` pod recreation, but it is not a replacement for a real Artifact Store.
+- Artifact cleanup is asynchronous and idempotent over `artifact-cleanup-requested`.
 - The target state should also add idempotency handling, retry strategy, and durable event publication around the generation-to-deployment handoff.
 
 For the target-state sequence source, see [PlantUML source: `docs/uml/scaffoldops-flow.puml`](/home/victor/workspace/ScaffoldOps/scaffoldops-docs/docs/uml/scaffoldops-flow.puml).

@@ -6,10 +6,12 @@ participant Keycloak
 participant "generator-api" as API
 database PostgreSQL as DB
 queue "Kafka topic:\ngeneration-requested" as GenTopic
+queue "Kafka topic:\nartifact-cleanup-requested" as CleanupTopic
 queue "Kafka topic:\ndeployment-requested" as DepTopic
 participant "generator-worker" as GenWorker
 participant "deployment-worker" as DepWorker
-collections "Artifact Store" as ArtifactStore
+collections "generator-worker-artifacts-pvc\n(current MVP)" as WorkerPVC
+collections "Real Artifact Store\n(future)" as ArtifactStore
 participant Kubernetes as K8s
 
 Client -> Keycloak : Authenticate
@@ -24,11 +26,19 @@ GenTopic -> GenWorker : Consume generation-requested
 GenWorker -> API : Update status(GENERATING)
 API -> DB : Persist GENERATING
 
-GenWorker -> ArtifactStore : Generate artifact/manifests
+GenWorker -> ArtifactStore : Store generated artifact/manifests
 ArtifactStore --> GenWorker : artifactRef
 
 GenWorker -> API : Update status(GENERATED)
 API -> DB : Persist GENERATED
+
+group Current MVP artifact cleanup
+  Client -> API : Delete generation request
+  API -> DB : Delete request row
+  API -> CleanupTopic : Publish artifact-cleanup-requested
+  CleanupTopic -> GenWorker : Consume cleanup request
+  GenWorker -> WorkerPVC : Delete /var/lib/generator-worker/manifests/<serviceName>-<requestId>/
+end
 
 GenWorker -> DepTopic : Publish deployment-requested\n(requestId, artifactRef, target)
 

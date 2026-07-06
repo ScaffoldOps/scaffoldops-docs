@@ -23,13 +23,21 @@ Today, the implemented platform is centered on:
 - shared Kubernetes infrastructure: PostgreSQL, Keycloak, Kafka, Kafka UI, and namespaces
 - GitHub Actions pipelines running on self-hosted runners
 
-The target-state architecture now also defines:
+The current MVP also includes:
+
+- `generator-worker` generation-stage lifecycle callbacks to `generator-api`
+- deterministic Spring Boot project output from `generator-worker`
+- generated artifacts stored in the worker pod at `/var/lib/generator-worker/manifests`
+- a `generator-worker-artifacts-pvc` PersistentVolumeClaim in `scaffoldops-dev`
+- asynchronous artifact cleanup through Kafka topic `artifact-cleanup-requested`
+
+The target-state architecture still defines:
 
 - a future `deployment-worker`
-- a future `deployment-requested` Kafka topic
-- a durable artifact handoff between generation and deployment
+- a real Artifact Store such as object storage or an artifact repository
+- a durable artifact-reference handoff from generation to deployment
 
-The codebase is beyond the original planned MVP, but it is not yet a complete end-to-end scaffold-and-deploy platform. In particular, there is currently no implemented `deployment-worker`, no real project generation engine output, and no real lifecycle callback integration from workers back into the API.
+The codebase is beyond the original planned MVP, but it is not yet a complete end-to-end scaffold-and-deploy platform. `generator-worker` now generates a real minimal Spring Boot project and patches generation lifecycle state back into `generator-api`, but there is still no implemented `deployment-worker` and no real Artifact Store.
 
 
 ## Architecture References
@@ -49,12 +57,17 @@ The rendered target-state sequence diagram is available in [docs/architecture/hi
   - accepts generation requests
   - validates and stores them in PostgreSQL
   - publishes `generation-requested` Kafka events
+  - publishes `artifact-cleanup-requested` Kafka events when requests are deleted
   - secures generation endpoints with JWT bearer auth
 - `generator-worker`
   - Spring Boot 3 / Java 17 background worker
   - consumes `generation-requested` events from Kafka
-  - performs placeholder generation handling
-  - emits placeholder lifecycle updates to logging adapters
+  - writes a minimal generated Spring Boot project with Docker and Kubernetes assets
+  - stores generated artifacts under `/var/lib/generator-worker/manifests` in Kubernetes
+  - generated artifacts include `pom.xml`, `Dockerfile`, Kubernetes manifests, `HelloApplication.java`, `HelloController.java`, and `generation-manifest.json`
+  - mounts `generator-worker-artifacts-pvc` at `/var/lib/generator-worker` in `scaffoldops-dev`
+  - patches generation lifecycle updates back into `generator-api`
+  - consumes `artifact-cleanup-requested` and deletes generated artifact directories it owns
   - exposes only actuator endpoints
 
 ### Target-state application component
@@ -88,16 +101,19 @@ The current implemented flow is:
 3. `generator-api` validates the request and stores it in PostgreSQL with status `RECEIVED`.
 4. `generator-api` publishes a Kafka message to the `generation-requested` topic.
 5. `generator-worker` consumes the Kafka message.
-6. `generator-worker` emits placeholder lifecycle transitions.
-7. The worker currently logs those lifecycle updates instead of sending them back to a real downstream API.
+6. `generator-worker` patches `generator-api` to `GENERATING`.
+7. `generator-worker` writes a generated Spring Boot project and a `generation-manifest.json`.
+8. Generated artifacts are stored under `/var/lib/generator-worker/manifests/<serviceName>-<requestId>/`; in Kubernetes this path is backed by `generator-worker-artifacts-pvc`.
+9. `generator-worker` patches `generator-api` to `GENERATED` with `artifactRef` and, when built, `imageRef`.
+10. If the request is deleted, `generator-api` publishes `artifact-cleanup-requested` and `generator-worker` deletes the matching artifact directory from its PVC.
+11. Artifact cleanup is eventually consistent, not transactional with the PostgreSQL delete; if `generator-worker` is down, cleanup waits until Kafka is consumed.
 
 The refined target-state flow extends that model:
 
-1. `generator-worker` keeps the generation engine internally.
-2. On successful generation it writes output to a durable artifact location.
-3. `generator-worker` publishes `deployment-requested`.
-4. `deployment-worker` consumes that event and deploys to Kubernetes.
-5. `generator-api` remains the lifecycle system of record for both generation and deployment stages.
+1. A real Artifact Store replaces the pod-local/PVC-backed `file://` artifact reference.
+2. `generator-worker` publishes `deployment-requested` as the generation-to-deployment handoff.
+3. `deployment-worker` consumes that event and deploys to Kubernetes.
+4. `generator-api` remains the lifecycle system of record for both generation and deployment stages.
 
 The API status model already includes future-facing values such as `DEPLOYING` and `DEPLOYED`, but the deployed code does not yet implement the deployment stage.
 
@@ -118,6 +134,7 @@ Key details:
 - public docs: Swagger UI and OpenAPI JSON
 - public actuator health endpoints
 - Kafka topic default: `generation-requested`
+- cleanup topic default: `artifact-cleanup-requested`
 - JWT issuer default: `http://localhost:8091/realms/scaffoldops`
 
 Important references in that repository:
@@ -133,9 +150,10 @@ Important references in that repository:
 Main responsibilities:
 
 - Kafka consumption
-- asynchronous job orchestration shell
-- placeholder lifecycle handling
-- placeholder project generation adapter
+- asynchronous generation orchestration
+- generation-stage lifecycle callback delivery to `generator-api`
+- deterministic Spring Boot project generation
+- PVC-backed generated artifact storage in Kubernetes
 
 Key details:
 
@@ -143,7 +161,10 @@ Key details:
 - actuator endpoints only
 - Kafka consumer group default: `generator-worker`
 - topic default: `generation-requested`
+- cleanup topic default: `artifact-cleanup-requested`
 - local lifecycle base URL default: `http://localhost:8081`
+- Kubernetes artifact path: `/var/lib/generator-worker/manifests`
+- MVP Kubernetes artifact PVC: `generator-worker-artifacts-pvc`
 
 Important references in that repository:
 
@@ -241,14 +262,16 @@ Implemented:
 - JWT resource server configuration
 - Kafka publication from API
 - Kafka consumption in worker
-- worker lifecycle state shell
+- worker lifecycle callbacks to `generator-api`
+- generated Spring Boot project output from `generator-worker`
+- PVC-backed generated artifact persistence for the Kubernetes worker pod
+- asynchronous cleanup of generated artifacts after generation request deletion
 - Kubernetes manifests for API, worker, PostgreSQL, Keycloak, Kafka, and Kafka UI
 - self-hosted GitHub Actions based delivery pipelines
 
 Not implemented yet:
 
-- real scaffold generation output
-- lifecycle callback/update path back into `generator-api`
+- real Artifact Store such as MinIO/S3 or an artifact repository
 - deployment worker
 - actual deployment stage execution
 - retry, dead-letter, or idempotency workflow in the worker

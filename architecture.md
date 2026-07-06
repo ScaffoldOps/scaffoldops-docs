@@ -33,6 +33,8 @@ At a high level:
 - PostgreSQL is the lifecycle system-of-record backend used by `generator-api`
 - Kafka is the asynchronous handoff bus between processing stages
 - `generator-worker` owns generation execution
+- generated artifacts are stored under `/var/lib/generator-worker/manifests`; in Kubernetes this path is backed by `generator-worker-artifacts-pvc`
+- generated artifact cleanup is asynchronous over Kafka topic `artifact-cleanup-requested`
 - `deployment-worker` is the future deployment-stage worker
 - Keycloak provides JWT issuance for protected API access
 - Kubernetes manifests and overlays are managed in `platform-infra`
@@ -48,14 +50,15 @@ Current responsibilities:
 - persist request records in PostgreSQL
 - set initial status to `RECEIVED`
 - publish a `generation-requested` Kafka event after persistence
+- publish an `artifact-cleanup-requested` Kafka event after deleting a request
 - expose request lookup endpoints
+- accept internal generation lifecycle callbacks from `generator-worker`
 - enforce JWT bearer authentication on business endpoints
 
 Not implemented yet in current code:
 
 - no project generation execution
 - no deployment execution
-- no inbound lifecycle update API from downstream workers yet
 
 ### 3.2 `generator-worker`
 
@@ -63,15 +66,16 @@ Current responsibilities:
 
 - consume `generation-requested` Kafka events
 - map inbound events into internal generation jobs
-- orchestrate a placeholder generation flow
-- emit placeholder lifecycle updates through an outbound port
+- patch `generator-api` to `GENERATING`, `GENERATED`, or `FAILED`
+- generate a deterministic Spring Boot Hello World project
+- write `pom.xml`, `Dockerfile`, Kubernetes manifests, Java source files, and `generation-manifest.json`
+- expose generated artifacts through a `file://` `artifactRef`
+- mount `generator-worker-artifacts-pvc` at `/var/lib/generator-worker` in the Kubernetes DEV deployment
+- consume `artifact-cleanup-requested` and delete matching artifact directories under the configured manifest output directory
 
 Not implemented yet in current code:
 
-- no real generation engine output yet
-- no durable artifact handoff yet
-- no outbound HTTP lifecycle delivery yet
-- no deployment handoff publication yet
+- no real Artifact Store such as MinIO/S3 or artifact repository yet
 - no deployment execution
 
 ### 3.3 Shared PostgreSQL
@@ -110,10 +114,16 @@ Current role:
 - asynchronous handoff from `generator-api` to `generator-worker`
 - operational inspection via Kafka UI
 - infra-owned topic bootstrap for `generation-requested`
+- infra-owned topic bootstrap for `artifact-cleanup-requested`
 
-Current known managed topic:
+Current known infra-managed topic:
 
 - `generation-requested`
+- `artifact-cleanup-requested`
+
+Application code may also publish or consume additional topics as the workflow
+evolves; shared infra currently bootstraps the generation intake and artifact
+cleanup topics.
 
 ## 4. Current Implemented Flow
 
@@ -126,23 +136,61 @@ Current known managed topic:
 5. The request is persisted with status `RECEIVED`.
 6. `generator-api` publishes a Kafka event to `generation-requested`.
 
-### 4.2 Asynchronous generation shell
+### 4.2 Asynchronous generation stage
 
 1. `generator-worker` consumes the Kafka event.
 2. The event is mapped into an internal generation job.
-3. The worker emits placeholder lifecycle updates through its lifecycle port.
-4. The worker invokes its placeholder generation port.
-5. On success, the worker emits `GENERATED`.
-6. On failure, the worker emits `FAILED` and rethrows.
+3. The worker patches `generator-api` to `GENERATING`.
+4. The worker generates a minimal Spring Boot project.
+5. The worker writes the project under `/var/lib/generator-worker/manifests/<serviceName>-<requestId>/` in Kubernetes.
+6. The Kubernetes deployment persists `/var/lib/generator-worker` on `generator-worker-artifacts-pvc`.
+7. On success, the worker patches `generator-api` to `GENERATED` with `artifactRef`.
+8. On failure, the worker patches `generator-api` to `FAILED` and rethrows.
 
-### 4.3 Current architectural break in the loop
+### 4.3 Asynchronous artifact cleanup
 
-The worker's lifecycle and generation adapters are still placeholders:
+1. A client deletes a generation request through `generator-api`.
+2. `generator-api` reads the existing request data, deletes the PostgreSQL row, and publishes `artifact-cleanup-requested`.
+3. `generator-worker` consumes the cleanup event.
+4. `generator-worker` derives the artifact directory from the stored request id and service name.
+5. `generator-worker` deletes only below the configured manifest output directory.
+6. If the directory is already absent, cleanup is logged and treated as success.
 
-- lifecycle updates are logged, not delivered to a real endpoint
-- generation work is logged, not executed into a durable artifact handoff
+In flow form:
 
-As a result, the platform is strongest today at intake, persistence, and asynchronous dispatch, but incomplete at true lifecycle convergence.
+```text
+DELETE /generation-requests/{id}
+  -> generator-api
+  -> Kafka topic artifact-cleanup-requested
+  -> generator-worker
+  -> PVC directory deletion
+```
+
+Cleanup is eventually consistent, not transactional with the PostgreSQL delete.
+If `generator-worker` is down, cleanup waits until Kafka is consumed. Full
+reconciliation of stuck cleanup or generation states remains future work.
+
+### 4.4 Current artifact persistence boundary
+
+The current MVP artifact reference is pod-local:
+
+```text
+file:///var/lib/generator-worker/manifests/<serviceName>-<requestId>/
+```
+
+The PVC means artifacts survive `generator-worker` pod recreation, but this is
+not a real Artifact Store. There is no object storage, download API, artifact
+repository, or cross-cluster artifact contract yet.
+
+Generated artifacts currently include `pom.xml`, `Dockerfile`, Kubernetes
+manifests, `HelloApplication.java`, `HelloController.java`, and
+`generation-manifest.json`.
+
+Ownership boundary:
+
+- `generator-api` owns request lifecycle state and the deletion API.
+- `generator-worker` owns generated artifacts and PVC cleanup.
+- `generator-api` must not access the worker PVC directly.
 
 ## 5. Refined Target-State Architecture
 
@@ -163,7 +211,7 @@ The target state keeps the current separation of concerns and extends it into a 
 - consumes `generation-requested`
 - keeps the generation engine internally
 - updates generation-stage lifecycle through `generator-api`
-- produces a durable artifact or manifest reference
+- produces a generated project reference
 - publishes `deployment-requested` after successful generation
 
 #### `deployment-worker`
@@ -174,11 +222,11 @@ The target state keeps the current separation of concerns and extends it into a 
 
 ### 5.2 Target-state stage handoff
 
-The generation-to-deployment boundary must include a durable handoff artifact.
+The generation-to-deployment boundary must eventually include a durable handoff artifact outside the worker pod filesystem.
 
 That means the design should explicitly include:
 
-- an artifact store, repository, or other durable output location
+- an artifact store, repository, or other durable output location such as MinIO/S3 or an artifact repository
 - an artifact reference in `deployment-requested`
 - request identity and target deployment metadata in both Kafka contracts
 
@@ -271,7 +319,9 @@ The current UML and target state assume these constraints:
 
 - `deployment-worker` does not exist yet
 - `generator-worker` keeps the generation engine internally and is not decomposed into a separate generation microservice
-- `generator-worker` publishes a deployment event after successful generation
+- current Kubernetes artifact persistence is PVC-backed and uses `file://` references, not a real Artifact Store
+- target-state generation-to-deployment handoff requires a real Artifact Store or equivalent durable artifact boundary
+- `generator-worker` publishes a deployment event after successful generation when deployment handoff is enabled
 - `deployment-worker` consumes that event and deploys to Kubernetes
 - `generator-api` remains the lifecycle system of record
 
@@ -284,6 +334,8 @@ The target-state design should explicitly account for:
 - failure after generation succeeds but before `deployment-requested` is durably published
 - failure after deployment succeeds but before lifecycle status is persisted back in `generator-api`
 - durable artifact-reference handoff between generation and deployment
+- race handling if a request is deleted while an older generation event is still being processed
+- migration from pod-local `file://` artifact references to an Artifact Store reference usable by future deployment workers
 
 ## 10. Documentation Guidance
 
@@ -291,6 +343,7 @@ When updating repository docs from this point forward:
 
 - document current implementation separately from target-state design
 - do not describe `deployment-worker` as implemented until the repository and deployment assets exist
+- do not describe the current PVC as a real Artifact Store
 - do not model the generation engine as a standalone service
 - keep `generator-api` as the documented lifecycle source of truth
 - keep `deployment-requested` and artifact handoff explicit in architecture diagrams once target-state material is discussed
