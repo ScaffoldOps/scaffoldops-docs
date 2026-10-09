@@ -1,64 +1,38 @@
 @startuml
-title ScaffoldOps simplified target flow
-
 actor Client
-participant Keycloak
 participant "generator-api" as API
-database PostgreSQL as DB
-queue "Kafka topic:\ngeneration-requested" as GenTopic
-queue "Kafka topic:\nartifact-cleanup-requested" as CleanupTopic
-queue "Kafka topic:\ndeployment-requested" as DepTopic
-participant "generator-worker" as GenWorker
-participant "deployment-worker" as DepWorker
-collections "generator-worker-artifacts-pvc\n(current MVP)" as WorkerPVC
-collections "Real Artifact Store\n(future)" as ArtifactStore
-participant Kubernetes as K8s
-
-Client -> Keycloak : Authenticate
-Keycloak --> Client : JWT
-
-Client -> API : Create generation request
-API -> DB : Save request(RECEIVED)
-API -> GenTopic : Publish generation-requested
-API --> Client : Request accepted
-
-GenTopic -> GenWorker : Consume generation-requested
-GenWorker -> API : Update status(GENERATING)
-API -> DB : Persist GENERATING
-
-GenWorker -> ArtifactStore : Store generated artifact/manifests
-ArtifactStore --> GenWorker : artifactRef
-
-GenWorker -> API : Update status(GENERATED)
-API -> DB : Persist GENERATED
-
-group Current MVP artifact cleanup
-  Client -> API : Delete generation request
-  API -> DB : Delete request row
-  API -> CleanupTopic : Publish artifact-cleanup-requested
-  CleanupTopic -> GenWorker : Consume cleanup request
-  GenWorker -> WorkerPVC : Delete /var/lib/generator-worker/manifests/<serviceName>-<requestId>/
-end
-
-GenWorker -> DepTopic : Publish deployment-requested\n(requestId, artifactRef, target)
-
-DepTopic -> DepWorker : Consume deployment-requested
-DepWorker -> API : Update status(DEPLOYING)
-API -> DB : Persist DEPLOYING
-
-DepWorker -> K8s : Deploy artifact/manifests
-alt deployment success
-  K8s --> DepWorker : Ready
-  DepWorker -> API : Update status(DEPLOYED)
-  API -> DB : Persist DEPLOYED
-else deployment failure
-  K8s --> DepWorker : Error
-  DepWorker -> API : Update status(FAILED)
-  API -> DB : Persist FAILED
-end
-
-Client -> API : Get request status
-API -> DB : Read current status
-API --> Client : Current lifecycle state
-
+queue Kafka
+participant "generator-worker" as G
+participant MinIO
+participant "Docker Hub" as Hub
+participant "deployment-worker" as D
+participant Kubernetes as K
+Client -> API: POST generation-requests
+API -> Kafka: generation-requested
+Kafka -> G: generation request
+G -> API: GENERATING
+G -> MinIO: project ZIP
+G -> Hub: build and push image
+G -> API: GENERATED with artifactRef and imageRef
+(or GENERATION_FAILED with diagnostics)
+Client -> API: POST id/deployment
+API -> Kafka: deployment-requested
+Kafka -> D: imageRef and namespace
+D -> K: apply Deployment / Service, await rollout
+D -> API: DEPLOYED or DEPLOYMENT_FAILED
+Client -> API: DELETE id/deployment
+API -> Kafka: undeployment-requested
+Kafka -> D: undeploy
+D -> K: delete owned resources
+D -> API: NOT_DEPLOYED or DEPLOYMENT_FAILED
+note over MinIO, Hub: Undeploy preserves artifact and image
+Client -> API: DELETE generation-requests/id
+API -> API: delete DB state
+API -> Kafka: artifact-cleanup-requested
+Kafka -> G: asset cleanup
+G -> MinIO: remove artifact
+G -> Hub: remove supported tag if enabled
+G -> G: remove workspace
+Kafka -> D: Kubernetes cleanup
+D -> K: delete owned resources
 @enduml
